@@ -1,10 +1,12 @@
 import os
 import time
 import asyncio
+import subprocess
 import threading
 from datetime import datetime
 from pydantic import BaseModel, Field
-from fastapi import HTTPException, Header  # noqa NID002
+from fastapi import HTTPException, Header, Query  # noqa NID002
+from fastapi.responses import StreamingResponse
 from async_timeout import timeout
 
 import lazyllm
@@ -145,9 +147,16 @@ class InferServer(ServerBase):
         save_root = os.path.join(lazyllm.config['infer_log_root'], token, job_id)
         os.makedirs(save_root, exist_ok=True)
         # wait 5 minutes for launch cmd
-        hypram = dict(launcher=lazyllm.launchers.remote(sync=False, ngpus=job.num_gpus, retry=30), log_path=save_root, tp=job.num_gpus)
-        m = lazyllm.TrainableModule(job.model_name, use_model_map=False)\
-            .deploy_method((getattr(lazyllm.deploy, job.framework), hypram))
+        hypram = dict(
+            launcher=lazyllm.launchers.remote(sync=False, ngpus=job.num_gpus, retry=30),
+            log_path=save_root,
+        )
+        if job.framework.lower() not in ("infinity", "embeddingdeploy", "rerankdeploy"):
+            hypram["tp"] = job.num_gpus
+            hypram["gpu_memory_utilization"] = 0.3
+        m = lazyllm.TrainableModule(job.model_name, use_model_map=False).deploy_method(
+            (getattr(lazyllm.deploy, job.framework), hypram)
+        )
 
         # Launch Deploy:
         thread = threading.Thread(target=m.start)
@@ -248,3 +257,60 @@ class InferServer(ServerBase):
             return {'log': info['log_path']}
         else:
             return {'log': 'invalid'}
+
+    @app.get('/v1/system/file')
+    async def stream_system_file(self, path: str = Query(..., description="Absolute file path on the server"),
+                                  token: str = Header(DEFAULT_TOKEN)):  # noqa B008
+        if not self._in_user_job_info(token):
+            self._update_user_job_info(token)
+        await self.authorize_current_user(token)
+        if not path:
+            raise HTTPException(status_code=400, detail='Path parameter is required')
+        real_path = os.path.realpath(path)
+        if not os.path.exists(real_path):
+            raise HTTPException(status_code=404, detail=f'File not found: {path}')
+        if not os.path.isfile(real_path):
+            raise HTTPException(status_code=400, detail=f'Not a file: {path}')
+
+        async def line_generator():
+            with open(real_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    yield line
+
+        return StreamingResponse(line_generator(), media_type='text/plain')
+
+    @app.get('/v1/system/gpu_status')
+    async def get_system_gpu_status(self, token: str = Header(DEFAULT_TOKEN)):  # noqa B008
+        if not self._in_user_job_info(token):
+            self._update_user_job_info(token)
+        await self.authorize_current_user(token)
+        try:
+            result = subprocess.run(
+                ['nvidia-smi', '--query-gpu=index,name,utilization.gpu,memory.total,memory.used,memory.free,temperature.gpu',
+                 '--format=csv,noheader,nounits'],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode != 0:
+                return {'gpu_count': 0, 'gpus': [], 'error': result.stderr.strip()}
+            gpus = []
+            for line in result.stdout.strip().split('\n'):
+                if not line.strip():
+                    continue
+                parts = [p.strip() for p in line.split(',')]
+                if len(parts) >= 7:
+                    gpus.append({
+                        'index': int(parts[0]),
+                        'name': parts[1],
+                        'utilization_gpu': f'{parts[2]}%',
+                        'memory_total_mb': parts[3],
+                        'memory_used_mb': parts[4],
+                        'memory_free_mb': parts[5],
+                        'temperature_gpu': f'{parts[6]}°C',
+                    })
+            return {'gpu_count': len(gpus), 'gpus': gpus}
+        except FileNotFoundError:
+            return {'gpu_count': 0, 'gpus': [], 'error': 'nvidia-smi not found (no NVIDIA GPU?)'}
+        except subprocess.TimeoutExpired:
+            return {'gpu_count': 0, 'gpus': [], 'error': 'nvidia-smi timed out'}
+        except Exception as e:
+            return {'gpu_count': 0, 'gpus': [], 'error': str(e)}

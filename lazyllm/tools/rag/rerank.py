@@ -103,17 +103,64 @@ class ModuleReranker(Reranker):
         else:
             self._reranker = model
 
-    def forward(self, nodes: List[DocNode], query: str = '') -> List[DocNode]:
+    def forward(self, nodes: List[DocNode], query: str = "") -> List[DocNode]:
+        import sys
+        print("DEBUG: ModuleReranker.forward CALLED", file=sys.stderr)
+        
         if not nodes:
             return self._post_process([])
 
-        docs = [node.get_text(metadata_mode=MetadataMode.EMBED) for node in nodes]
-        top_n = self._kwargs['topk'] if 'topk' in self._kwargs else len(docs)
-        sorted_indices = self._reranker(query, documents=docs, top_n=top_n)
+        if isinstance(query, dict):
+            query_str = query.get("text", query.get("query", str(query)))
+        elif hasattr(query, "get_text"):
+            query_str = query.get_text()
+        else:
+            query_str = str(query) if query else ""
+
+        if isinstance(query_str, DocNode):
+            query_str = query_str.get_text()
+        elif not isinstance(query_str, str):
+            query_str = str(query_str)
+
+        print(f"DEBUG: query_str={query_str[:50] if len(query_str) > 50 else query_str}, type={type(query_str)}", file=sys.stderr)
+
+        docs = []
+        input_is_docnode = isinstance(nodes[0], DocNode)
+
+        print(f"DEBUG: input_is_docnode={input_is_docnode}", file=sys.stderr)
+
+        for i, node in enumerate(nodes):
+            if isinstance(node, str):
+                docs.append(node)
+            elif isinstance(node, dict):
+                docs.append(node.get("text", str(node)))
+            elif isinstance(node, DocNode):
+                docs.append(node.get_text(metadata_mode=MetadataMode.EMBED))
+            else:
+                docs.append(str(node))
+
+            if not isinstance(docs[-1], str):
+                docs[-1] = str(docs[-1])
+
+            if i < 3:
+                print(f"DEBUG: node[{i}] type={type(node)}, doc={docs[-1][:50] if len(docs[-1]) > 50 else docs[-1]}", file=sys.stderr)
+
+        print(f"DEBUG: docs[0] type={type(docs[0]) if docs else 'empty'}", file=sys.stderr)
+
+        top_n = self._kwargs["topk"] if "topk" in self._kwargs else len(docs)
+        sorted_indices = self._reranker(query_str, documents=docs, top_n=top_n)
         results = []
-        for index, relevance_score in sorted_indices:
-            results.append(nodes[index].with_score(relevance_score))
-        LOG.debug(f'Rerank use `{self._name}` and get nodes: {results}')
+
+        if not input_is_docnode:
+            for index, relevance_score in sorted_indices:
+                node = DocNode(text=docs[index])
+                node.relevance_score = relevance_score
+                results.append(node)
+        else:
+            for index, relevance_score in sorted_indices:
+                results.append(nodes[index].with_score(relevance_score))
+
+        print(f"DEBUG: Rerank complete, results count={len(results)}", file=sys.stderr)
         return self._post_process(results)
 
 # User-defined similarity decorator
