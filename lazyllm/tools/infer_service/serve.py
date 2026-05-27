@@ -292,14 +292,19 @@ class InferServer(ServerBase):
             )
             if result.returncode != 0:
                 return {'gpu_count': 0, 'gpus': [], 'error': result.stderr.strip()}
+            visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+            visible_set = set(int(x) for x in visible_devices.strip().split(',')) if visible_devices else None
             gpus = []
             for line in result.stdout.strip().split('\n'):
                 if not line.strip():
                     continue
                 parts = [p.strip() for p in line.split(',')]
                 if len(parts) >= 7:
+                    idx = int(parts[0])
+                    if visible_set is not None and idx not in visible_set:
+                        continue
                     gpus.append({
-                        'index': int(parts[0]),
+                        'index': idx,
                         'name': parts[1],
                         'utilization_gpu': f'{parts[2]}%',
                         'memory_total_mb': parts[3],
