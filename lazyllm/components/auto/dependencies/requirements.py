@@ -12,6 +12,8 @@ collie-lm
 llamafactory
 ''', lightllm='''
 lightllm
+''', lmdeploy='''
+lmdeploy
 ''', vllm='''
 vllm
 ''')

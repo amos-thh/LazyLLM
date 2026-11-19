@@ -760,6 +760,12 @@ class TrainServer(ServerBase):
                     raise HTTPException(status_code=404, detail='dataset download failed')
             except Exception as e:
                 raise HTTPException(status_code=404, detail=f'dataset download failed: {str(e)}')
+        else:
+            logger.info(f'[create_job] use local dataset path: {data_path}')
+            if not os.path.exists(data_path):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f'dataset file not found: {data_path}')
 
         if not stage or stage == 'sft':
             data_path = uniform_sft_dataset(data_path, target='alpaca')

@@ -5,8 +5,10 @@ import uuid
 import copy
 import psutil
 import random
+import shutil
 import threading
 import subprocess
+import importlib.util
 import multiprocessing
 from enum import Enum
 from datetime import datetime
@@ -78,6 +80,44 @@ lazyllm.config.add('launcher', str, 'empty', 'DEFAULT_LAUNCHER',
                    description='The default remote launcher to use if no launcher is specified.')
 lazyllm.config.add('cuda_visible', bool, False, 'CUDA_VISIBLE',
                    description='Whether to set the CUDA_VISIBLE_DEVICES environment variable.')
+lazyllm.config.add('npu_visible', bool, False, 'NPU_VISIBLE',
+                   description='Whether to set the ASCEND_RT_VISIBLE_DEVICES environment variable.')
+
+
+def _is_npu_available():
+    if importlib.util.find_spec('torch_npu') is not None:
+        return True
+    return shutil.which('npu-smi') is not None
+
+
+def parse_npu_smi_info(output):
+    # npu-smi prints two rows per NPU. The first row carries the NPU index and name;
+    # the second row carries the Bus-Id and a combined cell holding AICore(%), then
+    # Memory-Usage(MB) and HBM-Usage(MB). We take the LAST "used / total" pair of that
+    # row, which is HBM-Usage regardless of whether the columns are pipe-separated.
+    results, current_index = [], None
+    pair_re = re.compile(r'(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)')
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith('|'):
+            current_index = None
+            continue
+        cells = [c.strip() for c in line.strip('|').split('|')]
+        first = cells[0].split()[0] if cells and cells[0] else ''
+        if not first.isdigit():
+            continue
+        if len(cells) > 1 and ':' in cells[1]:  # second row of an NPU (Bus-Id present)
+            index = current_index if current_index is not None else int(first)
+            pairs = pair_re.findall(' '.join(cells[2:]))
+            if pairs:
+                used, total = float(pairs[-1][0]), float(pairs[-1][1])
+                if total > 0:
+                    results.append({'index': index, 'hbm_total_mib': int(total),
+                                    'hbm_used_mib': int(used), 'hbm_free_mib': int(total - used)})
+            current_index = None
+        else:  # first row of an NPU: cell[0] is "<index> <name>"
+            current_index = int(first)
+    return results
 
 
 # store cmd, return message and command output.
@@ -211,16 +251,20 @@ class EmptyLauncher(LazyLLMLaunchersBase):
         def _wrap_cmd(self, cmd):
             if self._launcher.ngpus == 0:
                 return cmd
-            gpus = self._launcher._get_idle_gpus()
-            if gpus and lazyllm.config['cuda_visible']:
+            devices = self._launcher._get_idle_gpus()
+            use_npu = _is_npu_available() and shutil.which('nvidia-smi') is None
+            visible_env = 'ASCEND_RT_VISIBLE_DEVICES' if use_npu else 'CUDA_VISIBLE_DEVICES'
+            visible_flag = lazyllm.config['npu_visible'] if use_npu else lazyllm.config['cuda_visible']
+            if devices and visible_flag:
                 if self._launcher.ngpus is None:
-                    empty_cmd = f'export CUDA_VISIBLE_DEVICES={gpus[0]} && '
-                elif self._launcher.ngpus <= len(gpus):
-                    empty_cmd = 'export CUDA_VISIBLE_DEVICES=' + \
-                                ','.join([str(n) for n in gpus[:self._launcher.ngpus]]) + ' && '
+                    empty_cmd = f'export {visible_env}={devices[0]} && '
+                elif self._launcher.ngpus <= len(devices):
+                    empty_cmd = f'export {visible_env}=' + \
+                                ','.join([str(n) for n in devices[:self._launcher.ngpus]]) + ' && '
                 else:
-                    error_info = (f'Not enough GPUs available. Requested {self._launcher.ngpus} GPUs, '
-                                  f'but only {len(gpus)} are available.')
+                    kind = 'NPUs' if use_npu else 'GPUs'
+                    error_info = (f'Not enough {kind} available. Requested {self._launcher.ngpus} {kind}, '
+                                  f'but only {len(devices)} are available.')
                     LOG.error(error_info)
                     raise error_info
             else:
@@ -291,6 +335,8 @@ class EmptyLauncher(LazyLLMLaunchersBase):
             )
         except Exception as e:
             LOG.warning(f'Get idle gpus failed: {e}, if you have no gpu-driver, ignor it.')
+            if _is_npu_available():
+                return self._get_idle_npus()
             return []
         lines = order_list.strip().split('\n')
 
@@ -306,6 +352,22 @@ class EmptyLauncher(LazyLLMLaunchersBase):
         gpu_info.sort(key=lambda x: x[1], reverse=True)
         LOG.info('Memory left:\n' + '\n'.join([f'{item[0]} GPU, left: {item[1]} MiB' for item in gpu_info]))
         return [info[0] for info in gpu_info]
+
+    def _get_idle_npus(self):
+        try:
+            output = subprocess.check_output(['npu-smi', 'info'], encoding='utf-8', errors='ignore')
+        except Exception as e:
+            LOG.warning(f'Get idle npus failed: {e}, if you have no npu-driver, ignor it.')
+            return []
+        npu_info = [(item['index'], item['hbm_free_mib']) for item in parse_npu_smi_info(output)]
+        npu_info.sort(key=lambda x: x[1], reverse=True)
+
+        str_num = os.getenv('ASCEND_RT_VISIBLE_DEVICES', None)
+        if str_num:
+            sub_npus = [int(x) for x in str_num.strip().split(',')]
+            npu_info = [item for item in npu_info if item[0] in sub_npus]
+        LOG.info('Memory left:\n' + '\n'.join([f'{item[0]} NPU, left: {item[1]} MiB' for item in npu_info]))
+        return [info[0] for info in npu_info]
 
 class RemoteLauncher(LazyLLMLaunchersBase):
     def __new__(cls, *args, sync=False, ngpus=1, **kwargs):

@@ -1,0 +1,139 @@
+
+x-cloud-env: &cloud-env
+  # ---- 平台 / 日志 ----
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  # platform key 会随 api 的请求头传进来, 这里无需配置; 如需固定可解开下一行
+  # LAZY_PLATFORM_KEY: ${LAZY_PLATFORM_KEY:-}
+
+  # ---- LazyLLM 运行时 ----
+  LAZYLLM_DEFAULT_LAUNCHER: empty     # llm-service 内部统一用 EmptyLauncher 管理子进程
+  LAZYLLM_CUDA_VISIBLE: "False"       # 昇腾必须 False: Infinity 会按 cuda_visible 追加 --device-id(NVIDIA 语义)
+  LAZYLLM_NPU_VISIBLE: "True"         # 允许 launcher 给子任务设置 ASCEND_RT_VISIBLE_DEVICES
+  LAZYLLM_MODEL_SOURCE: ${LAZYLLM_MODEL_SOURCE:-modelscope}   # modelscope | hf
+
+  # ---- 数据 / 模型路径 (必须与 api 侧一致, 否则找不到上传的配置文件与模型) ----
+  LAZYLLM_MODEL_PATH: /mnt/lustre/share_data/models
+  LAZYLLM_UPLOAD_PATH: /mnt/lustre/share_data/lazycraft/upload
+  LAZYLLM_MODEL_CACHE_DIR: /mnt/lustre/share_data/lazycraft/model_cache
+  HUGGINGFACE_HUB_CACHE: /mnt/lustre/share_data/lazycraft/exist_model/config
+  EXIST_MODEL_PATH: /mnt/lustre/share_data/lazycraft/exist_model/models_hub
+  LAZYLLM_TEMP_DIR: /mnt/lustre/share_data/temp
+  LAZYLLM_INFER_LOG_ROOT: /mnt/lustre/share_data/logs/infer
+  LAZYLLM_TRAIN_TARGET_ROOT: /mnt/lustre/share_data/finetune_models
+
+  # ---- 可选: 用 redis 时解开 (当前 llm-service 用进程内内存存 job 信息, 可不配) ----
+  # LAZYLLM_REDIS_URL: redis://:${REDIS_PASSWORD:-lazyai123456}@redis:6379/0
+
+name: dfplatform
+services:
+  llm-service:
+    container_name: llm-service          # 与全栈 AMS_ENDPOINT=http://llm-service:31340 对应
+    hostname: llm-service
+    image: ${LAZYLLM_IMAGE:-dfplatform/llm-service:v4}
+    build:
+      context: ..                           # 本目录 = LazyLLM 项目根
+      dockerfile: ${LAZYLLM_DOCKERFILE:-dockerfile.ascend-910b3}
+      # 许可守护 _launcher.so 不在镜像内 (无 additional_contexts / --build-context):
+      # 以单文件只读挂载提供, 见下方 volumes —— .so 变更只替换文件 + restart,
+      # 镜像构建完全与许可无关, 也不需要 BuildKit 附加上下文 (旧 compose 也可用)。
+      args:
+        CANN_IMAGE: ${CANN_IMAGE:-quay.io/ascend/cann:8.1.rc1-910b-ubuntu22.04-py3.10}
+        LAZYLLM_VERSION: ${LAZYLLM_VERSION:-0.7.1}          # 与源码 pyproject 一致
+        TORCH_VERSION: ${TORCH_VERSION:-2.5.1}
+        TORCHVISION_VERSION: ${TORCHVISION_VERSION:-0.20.1}
+        TORCH_NPU_VERSION: ${TORCH_NPU_VERSION:-2.5.1}
+        DEEPSPEED_VERSION: ${DEEPSPEED_VERSION:-0.15.0}
+        SENTENCE_TRANSFORMERS_VERSION: ${SENTENCE_TRANSFORMERS_VERSION:-3.0.1}
+        INFINITY_EMB_VERSION: ${INFINITY_EMB_VERSION:-0.0.77}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}   # 内网可换镜像源
+
+    # ---- 启动 / 生命周期 ----
+    restart: unless-stopped
+    init: true                             # 用 tini 收尸, 避免僵尸进程
+    stop_grace_period: 60s                 # 给推理/微调子进程优雅退出时间
+
+    # ---- 设备: 目标机无 ascend-docker-runtime, 手工挂载 ----
+    # 若以后装了 runtime, 可注释掉 devices + 驱动 volumes, 改用: runtime: ascend
+    devices:
+      # - /dev/davinci0
+      # - /dev/davinci1
+      # - /dev/davinci2
+      # - /dev/davinci3
+      # - /dev/davinci4
+      # - /dev/davinci5
+      - /dev/davinci6
+      - /dev/davinci7
+      - /dev/davinci_manager
+      - /dev/devmm_svm
+      - /dev/hisi_hdc
+
+    # ---- 端口: 让其他服务用 IP + 端口直连 ----
+    ports:
+      - "${BIND_IP:-0.0.0.0}:${AMS_PORT:-31340}:31340"   # AMS 推理
+      - "${BIND_IP:-0.0.0.0}:${FT_PORT:-31341}:31341"    # FT 微调
+    # 备选: 用宿主网络(省掉端口映射, 直接监听宿主 IP; 此时删掉上面的 ports/networks)
+    # network_mode: host
+
+    # ---- IPC / 共享内存: HCCL 多卡通信与 dataloader 需要 ----
+    ipc: host
+    shm_size: ${SHM_SIZE:-16gb}            # ipc: host 时以宿主 /dev/shm 为准, 保留作兜底
+    ulimits:
+      memlock: -1                          # HCCL 大页/锁内存
+      nofile:
+        soft: 1048576
+        hard: 1048576
+      stack: 67108864
+    security_opt:
+      - seccomp:unconfined
+
+    environment:
+      !!merge <<: *cloud-env
+      # 也可以按业务需要覆盖下面几个 (默认已在上面的 anchor 里)
+      # LAZYLLM_MODEL_SOURCE: modelscope
+      LAZYLLM_EXPECTED_LOG_MODULES: ${LAZYLLM_EXPECTED_LOG_MODULES:-all}
+      LAZYLLM_LOG_FILE_LEVEL: ${LAZYLLM_LOG_FILE_LEVEL:-INFO}
+
+    volumes:
+      # 与全栈 docker-compose.yml 共用同一份数据盘 (从本目录回溯到 LazyCraft/docker/volumes)
+      # 目录结构不同时用 SHARE_DATA_DIR 覆盖, 例如 SHARE_DATA_DIR=/data/share_data
+      - ${SHARE_DATA_DIR:-./volumes/share_data}:/mnt/lustre/share_data
+      - ./license/_launcher.cpython-310-aarch64-linux-gnu.so:/opt/llm-service/_launcher.cpython-310-aarch64-linux-gnu.so:ro
+      # - ./base.py:/opt/miniconda3/envs/lazyllm/lib/python3.10/site-packages/lazyllm/launcher/base.py
+      # 昇腾驱动 (手工挂载方案必需; ascend-docker-runtime 会自动注入, 这里手动给)
+      - /usr/local/Ascend/driver:/usr/local/Ascend/driver
+      - /usr/local/dcmi:/usr/local/dcmi
+      - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi
+
+    networks:
+      - dfplatform-network
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+    entrypoint: ["/bin/bash", "-lc"]
+    # setuptools 修复 / 昇腾 env / ldconfig 已固化进 Dockerfile;
+    # 许可由运行时挂载的 .so 承载(校验+看门狗+业务启动, 源码不进镜像)。此处只需一行入口。
+    command:
+      - |
+        exec /opt/miniconda3/envs/lazyllm/bin/python -u -c 'import sys;sys.path.insert(0,"/opt/llm-service");import _launcher;_launcher.boot()'
+
+networks:
+  dfplatform-network:
+    # 想与已存在的全栈网络合并, 把 name 改成全栈实际网络名并解开 external: true
+    # (此时删掉 driver/driver_opts, external 网络不能自定义 driver)
+    name: ${LAZYLLM_NETWORK:-dfplatform-network}
+    # external: true
+    driver: bridge
+    driver_opts:
+      com.docker.network.driver.mtu: "1400"
+
+
+# 10.184.17.235 10.47.3.102
+# docker swarm join --token SWMTKN-1-55v8xxf9zudwn9hsz041owndgezbncecquuqpisiaj3vmzlg23-470hkk2cae7o2m0wgjoyyean3 10.184.17.235:2377
+
+# 在机器 A 上执行
+# docker network create --driver overlay --attachable --opt com.docker.network.driver.mtu=1400 dfplatform-network
+# mount -t nfs 10.184.17.235:/home/xqbwg/llm_service/volumes/share_data /opt/dfplatform_main/volumes/share_data

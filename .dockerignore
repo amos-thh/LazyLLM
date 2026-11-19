@@ -1,0 +1,36 @@
+# 构建上下文瘦身: dockerfile.ascend-910b3 实际只需要 lazyllm/ 源码 + pyproject.toml
+# (编译产物 lazyllm_cpp*.so 来自 wheel, 不在此处构建)
+Tutorial/
+docs/
+examples/
+tests/
+scripts/
+LazyLLM-Env/
+.github/
+.git/
+.gitmodules
+.gitignore
+.readthedocs.yaml
+*.md
+LICENSE
+NOTICE
+CODE_OF_CONDUCT*
+dockerfile
+dockerfile.ascend-910b3
+Dockerfile
+docker-compose*.yml
+# 许可守护: 整个 docker/license/ 永远不进主构建上下文 —— 保证 .so 变更不会触及
+# "COPY . /tmp/LazyLLM" 那层; .so 由 compose 的 volumes 以单文件只读挂载进容器
+# (更新许可 = 覆盖 .so + docker compose restart, 不重建镜像)。
+docker/license/
+Makefile
+requirements.txt
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

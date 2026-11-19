@@ -10,7 +10,9 @@ from .utils import get_log_path, make_log_dir, parse_options_keys
 
 
 config.add('lmdeploy_eager_mode', bool, False, 'LMDEPLOY_EAGER_MODE',
-           description='Whether to use eager mode for lmdeploy.')
+           description='Whether to use eager mode for lmdeploy. Auto-detected: enabled by default '
+                       'on Ascend (torch_npu; the 910B graph runner crashes at warmup), disabled '
+                       'elsewhere. Set LMDEPLOY_EAGER_MODE=true/false to override.')
 
 class LMDeploy(LazyLLMDeployBase):
     keys_name_handle = {
@@ -47,6 +49,27 @@ class LMDeploy(LazyLLMDeployBase):
         self.random_port = False if 'server-port' in kw and kw['server-port'] else True
         self.temp_folder = make_log_dir(log_path, 'lmdeploy') if log_path else None
 
+    @staticmethod
+    def _enable_eager_mode():
+        '''Resolve whether to pass `--eager-mode` to lmdeploy.
+
+        On Ascend (torch_npu) eager mode is the safe default: the 910B graph
+        runner (CUDAGraphRunner) crashes during warmup because `attn_metadata`
+        is None. Set `LAZYLLM_LMDEPLOY_EAGER_MODE=false` (or `0`/`off`) to force
+        graph mode back on. On other devices behaviour is unchanged: graph mode
+        unless the config/env explicitly enables eager.
+
+        NOTE: `config.add(..., bool, None, ...)` cannot express "unset" because
+        `Config.getenv` coerces the `None` default to `False` for bool. The raw
+        env var is therefore the only reliable signal for "explicitly set".
+        '''
+        env = os.getenv('LAZYLLM_LMDEPLOY_EAGER_MODE')
+        if env is not None:
+            return env.strip().lower() in ('1', 'true', 'on', 'yes')
+        if config['lmdeploy_eager_mode']:
+            return True
+        return importlib.util.find_spec('torch_npu') is not None
+
     def cmd(self, finetuned_model=None, base_model=None):
         if not os.path.exists(finetuned_model) or \
             not any(filename.endswith('.bin') or filename.endswith('.safetensors')
@@ -61,8 +84,10 @@ class LMDeploy(LazyLLMDeployBase):
                 self.kw['server-port'] = random.randint(30000, 40000)
             cmd = f'lmdeploy serve api_server {finetuned_model} --model-name lazyllm '
 
-            if importlib.util.find_spec('torch_npu') is not None: cmd += '--device ascend '
-            if config['lmdeploy_eager_mode']: cmd += '--eager-mode '
+            if importlib.util.find_spec('torch_npu') is not None:
+                cmd += '--device ascend '
+            if self._enable_eager_mode():
+                cmd += '--eager-mode '
             cmd += self.kw.parse_kwargs()
             cmd += ' ' + parse_options_keys(self.options_keys)
             if self.temp_folder: cmd += f' 2>&1 | tee {get_log_path(self.temp_folder)}'

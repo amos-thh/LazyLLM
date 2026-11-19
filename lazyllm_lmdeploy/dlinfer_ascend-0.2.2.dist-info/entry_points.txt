@@ -1,0 +1,2 @@
+[torch_dynamo_backends]
+atbgraph = dlinfer.graph.dicp.vendor.AtbGraph:atbgraph

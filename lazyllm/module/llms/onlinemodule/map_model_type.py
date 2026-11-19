@@ -443,26 +443,27 @@ _TOKEN_MAP = {
     'tts': ('tts', 'cosyvoice', 'nova-tts'),
     'vlm': ('qwen-vl', 'vl', 'vision', 'caption', 'omni', 'vlm', 'seed'),
     'ocr': ('ocr',),
-    'rerank': ('rerank',),
+    'rerank': ('rerank', 'reranker', 'cross-encoder', 'colbert'),
     'cross_modal_embed': ('cross_modal', 'multimodal-embedding', 'embedding-vision'),
     'sd': ('dall', 'wan', 'sora', 'image', 'video', 't2i', 't2v'),
 }
 _SUFFIX_RE = re.compile(
     r'(?:'
     r'|[-_.]\d{4}(?:-\d{2}-\d{2})?'   # date-like suffix
-    r'|[-_.]v?\d+[a-z0-9\-]*'         # version-like suffix
+    r'|[-_.]v?\d+[a-z0-9]*'           # version-like suffix (numbers with letters directly attached)
     r')+$',
     flags=re.I
 )
 
-def _normalize_key(name: str) -> str:
+def _normalize_key(name: str, strip_suffix: bool = True) -> str:
     '''Normalize model name for consistent comparison.'''
     if not name:
         return ''
     s = name.strip().lower()
     s = re.sub(r'[^a-z0-9]+', '-', s)
     s = s.strip('-')
-    s = re.sub(_SUFFIX_RE, '', s)
+    if strip_suffix:
+        s = re.sub(_SUFFIX_RE, '', s)
     return s
 
 def _contains_token(name: str, token: str) -> bool:
@@ -486,9 +487,13 @@ def feature_keyword_rule(model_name: str) -> Optional[str]:
     if stripped_input in NORMALIZED_MODEL_MAPPING:
         return NORMALIZED_MODEL_MAPPING[stripped_input]
 
+    # Also scan the full name without suffix stripping: version-like suffixes
+    # can swallow keyword tokens (e.g. `qwen3.7-text-rerank` -> `qwen3`)
+    # and make models like rerank/embed fall through to the 'llm' default.
+    full_input = _normalize_key(model_name, strip_suffix=False)
     for model_type, tokens in _TOKEN_MAP.items():
         for tok in tokens:
-            if _contains_token(stripped_input, tok):
+            if _contains_token(stripped_input, tok) or _contains_token(full_input, tok):
                 return model_type
     return None
 def special_model_rule(model_name: str) -> Optional[str]:

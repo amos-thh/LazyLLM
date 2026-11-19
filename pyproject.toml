@@ -306,7 +306,7 @@ llama-factory = [
     "transformers",
     "accelerate",
     "qwen-vl-utils",
-    "lazyllm-lmdeploy"
+    # "lazyllm-lmdeploy"
 ]
 finetune-all = [
     "appdirs",

@@ -1,0 +1,40 @@
+# lmdeploy (NPU/910B3) 运行时二级依赖, 由 dockerfile.ascend-910b3 7c 步 pip 安装。
+# 背景:
+#   1) lmdeploy 本体(lmdeploy/ + lmdeploy-0.10.2.dist-info/)与 dlinfer
+#      (dlinfer/ + 其 dist-info, 910B 上源码编译产物)由仓库 vendored, 本文件不涉及;
+#   2) 这里只列纯 Python 依赖, 均可由任意 PyPI 镜像安装;
+#   3) transformers 必须 ==4.51.0 —— lmdeploy 0.10.2 硬性要求, 且 qwen3 等新架构需要
+#      新版 transformers 才能被 AutoConfig 识别 (4.48.0 的 CONFIG_MAPPING 无 qwen3)。
+#      此 pin 会覆盖 6 步 `lazyllm install` 的结果, 实机验证 import lazyllm 不受影响。
+#
+# 4) numpy 必须 <2 —— 硬约束, 不能只靠 6 步 requirements.txt 的 pin。
+#    CANN 8.1.RC1 的 TBE/GE 编译器仍使用 `np.float_` (numpy 2.0 已移除), 一旦装成
+#    numpy 2.x, 模型启动时 `SetPrecisionMode` 直接失败:
+#      RuntimeError: SetPrecisionMode ... error code is 500001
+#      EC0010: Failed to import Python module [AttributeError: `np.float_` was removed ...]
+#    实测本文件里的 xgrammar/apache-tvm-ffi 等新包会让 pip 在解析时把已装的
+#    numpy 1.26.4 升到 2.2.6, 因此这里显式 pin 死。dlinfer-ascend 0.2.2 与
+#    lazyllm 的元数据也都要求 numpy<2。
+numpy==1.26.4
+transformers==4.51.0
+mmengine-lite==0.10.7
+openai-harmony
+xgrammar
+pyzmq
+openai
+sentencepiece
+shortuuid
+partial_json_parser
+async-timeout
+toposort
+protobuf
+ray
+# structured output / serve 菜单相关, 预装避免运行期临时拉依赖
+outlines
+interegular
+# lmdeploy/dlinfer 的元数据里声明了但代码里并不 import 的依赖 (补齐后 pip 冲突告警消失;
+# 实测缺它们也能跑, 属于降低噪声/兜底)。nvidia-* 与 pynvml 是 CUDA 专用, arm/NPU 忽略。
+ml-dtypes
+tornado
+# lmdeploy 的 metrics 子系统 (metrics/loggers.py) 需要; 不开 metrics 也可不装
+prometheus_client

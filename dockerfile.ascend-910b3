@@ -1,0 +1,253 @@
+# ============================================================
+# LazyLLM 昇腾 (Ascend 910B3) NPU 版 镜像
+#
+# Build context: back/LazyLLM  (即本目录)
+#   docker build -f dockerfile.ascend-910b3 -t lazyllm:ascend-910b3 .
+#   (镜像内不再内嵌 _launcher.so: 许可模块以单文件只读 bind 挂载到 /opt/llm-service/,
+#    由 docker/docker-compose.yml 的 volumes 声明。.so 变更无需重建镜像 —— 覆盖文件
+#    后 docker compose restart 即可, 彻底绕开安装型 build 及其缓存问题。)
+#
+# 版本组合 (以 LazyLLM 自身依赖为准, 见 LazyLLM-Env/poetry.lock):
+#   lazyllm-llamafactory 的 torch-npu extra 明确钉住: torch-npu==2.5.1 + torchvision==0.20.1
+#   Ascend 官方适配表: CANN 8.1.RC1  <->  torch 2.5.1  <->  torch_npu 2.5.1
+#   => 默认 CANN 8.1.RC1 基础镜像 + torch/torch_npu 2.5.1
+#
+#   宿主驱动 25.3.RC1 比 CANN 8.1.RC1 新, 新驱动一般向下兼容旧 CANN (已有 HDK 25.0.RC1 + CANN 8.1.RC1
+#   的实机组合)。若运行时报 CANN/driver 不匹配, 可换 CANN 8.2.RC1 / 8.3.RC1 基础镜像, torch_npu 仍可
+#   先保持 2.5.1; 仍不行才升 torch_npu (见下方 ARG, 可覆盖)。
+#
+# 包安装策略 (按用户确认):
+#   1) pip 装官方发布包 lazyllm (核心依赖全在公开 PyPI)
+#   2) 在源码目录执行 `lazyllm install <extra>` 由 lazyllm 自己按 pyproject 依赖表安装;
+#      lazyllm-llamafactory==0.9.4.dev2 / lazyllm-lmdeploy==0.10.2.dev0 是 PyPI 上的
+#      **pre-release**。llamafactory 有 aarch64 轮子可装; 但 lmdeploy(lazyllm-lmdeploy 是其
+#      改名重发)的 wheel 官方只发 manylinux2014_x86_64/win_amd64 —— arm(NPU) 上 pip 直装
+#      永久不可行。lmdeploy 及其昇腾引擎 dlinfer(无任何 PyPI 发行)均改为仓库 vendored,
+#      由 7b 步 COPY 进 site-packages 接管; 运行时二级依赖见 7c。
+#      注意 `lazyllm install` 会用 [tool.poetry.dependencies] 里的 version 覆盖 extra 条目,
+#      因此实际装的是: transformers==4.57.1(以仓库 pyproject 为准, 实机为 4.48.0),
+#      peft==0.17.1, accelerate==1.6.0, lazyllm-llamafactory==0.9.4.dev2 等。
+#      deepspeed 在 pyproject 里只写了 `>=0.12.3` (无上界), 若不预装会被 pip 拉成过新版本,
+#      故此处按 LazyLLM-Env/poetry.lock 预钉 deepspeed==0.15.0 (在 fork 的 <=0.16.9 之内)。
+#   3) LazyCraft 的模型清单还包含 bge 向量/重排模型, 对应 LazyLLM 的 Infinity / RerankDeploy,
+#      因此除 llama-factory 外还需 sentence-transformers + infinity-emb (锁文件版本 3.0.1 / 0.0.77)。
+#   4) 用本地(已改 NPU 适配)的 lazyllm/ 源码覆盖 site-packages 里的 .py 文件;
+#      只做合并拷贝, 保留 wheel 里的编译产物 lazyllm/lazyllm_cpp*.so。
+#      另把源码根 pyproject.toml 拷进包目录, 供运行期 `lazyllm install` /
+#      thirdparty.load_toml_dep_group() 读取 (包目录内默认没有该文件)。
+# ============================================================
+
+ARG CANN_IMAGE=quay.io/ascend/cann:8.1.rc1-910b-ubuntu22.04-py3.10
+FROM ${CANN_IMAGE}
+
+# 与 LazyLLM 源码版本一致 (源码 pyproject: 0.7.1); 官方镜像用的是 0.7.2, 可覆盖
+ARG LAZYLLM_VERSION=0.7.1
+ARG TORCH_VERSION=2.5.1
+ARG TORCHVISION_VERSION=0.20.1
+ARG TORCH_NPU_VERSION=2.5.1
+# 见 LazyLLM-Env/poetry.lock (fork 允许 deepspeed<=0.16.9)
+ARG DEEPSPEED_VERSION=0.15.0
+ARG SENTENCE_TRANSFORMERS_VERSION=3.0.1
+ARG INFINITY_EMB_VERSION=0.0.77
+# llama-factory extra 同时覆盖微调(LLaMA-Factory)与离线推理(LMDeploy), 不含 CUDA-only 的 vllm/lightllm
+ARG LAZYLLM_EXTRAS=llama-factory
+# LazyCraft 模型清单用到的向量/重排部署依赖 (对应 Infinity / RerankDeploy)
+ARG LAZYLLM_EXTRA_PKGS="sentence-transformers infinity-emb"
+# 需要私有/镜像源时: --build-arg PIP_INDEX_URL=https://...
+ARG PIP_INDEX_URL=https://pypi.org/simple
+
+ARG MINICONDA_VERSION=py310_23.11.0-2
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=Asia/Shanghai
+ENV CONDA_DIR=/opt/miniconda3
+
+# ------------------------------------------------------------------
+# 1. CANN 运行环境: 每次启动 source set_env.sh
+#    (路径以该 CANN 镜像为准, 可 docker run --rm ${CANN_IMAGE} ls /usr/local/Ascend 确认)
+# ------------------------------------------------------------------
+RUN mkdir -p /etc/profile.d && \
+    printf 'source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null || true\n' > /etc/profile.d/ascend_env.sh && \
+    chmod 0644 /etc/profile.d/ascend_env.sh
+
+# ------------------------------------------------------------------
+# 2. 基础系统软件
+# ------------------------------------------------------------------
+RUN set -ex && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git wget curl vim ca-certificates openssh-server \
+        redis-server zip unzip cmake gcc g++ ffmpeg libgl1 && \
+    rm -rf /var/lib/apt/lists/*
+
+# ------------------------------------------------------------------
+# 3. Miniconda + conda env `lazyllm` (py3.10, 与 entrypoint 的 `source activate lazyllm` 对应)
+# ------------------------------------------------------------------
+RUN set -ex && \
+    ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ]; then \
+        MINICONDA_ARCH="aarch64"; \
+    else \
+        MINICONDA_ARCH="x86_64"; \
+    fi && \
+    wget -q "https://repo.anaconda.com/miniconda/Miniconda3-${MINICONDA_VERSION}-Linux-${MINICONDA_ARCH}.sh" \
+         -O /tmp/miniconda.sh && \
+    bash /tmp/miniconda.sh -b -p ${CONDA_DIR} && \
+    rm -f /tmp/miniconda.sh && \
+    ${CONDA_DIR}/bin/conda create -y -n lazyllm python=3.10 && \
+    ${CONDA_DIR}/bin/conda init bash && \
+    ${CONDA_DIR}/bin/conda clean -ya
+
+ENV PATH=${CONDA_DIR}/bin:${CONDA_DIR}/envs/lazyllm/bin:$PATH
+ENV CONDA_DEFAULT_ENV=lazyllm
+ENV PIP_INDEX_URL=${PIP_INDEX_URL}
+
+# ------------------------------------------------------------------
+# 4. NPU 计算栈: torch(CPU轮子) + torchvision + torch_npu + deepspeed + decorator
+#    torch_npu 2.5.1 对 torch 版本敏感, torchvision 用配套 0.20.1
+# ------------------------------------------------------------------
+RUN conda run -n lazyllm pip install --no-cache-dir \
+        torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} \
+        --index-url https://download.pytorch.org/whl/cpu && \
+    conda run -n lazyllm pip install --no-cache-dir \
+        torch-npu==${TORCH_NPU_VERSION} deepspeed==${DEEPSPEED_VERSION} decorator && \
+    conda run -n lazyllm pip install --no-cache-dir \
+        sentence-transformers==${SENTENCE_TRANSFORMERS_VERSION} infinity-emb==${INFINITY_EMB_VERSION}
+
+# ------------------------------------------------------------------
+# 5. 官方 lazyllm 发布包
+# ------------------------------------------------------------------
+RUN conda run -n lazyllm pip install --no-cache-dir "lazyllm==${LAZYLLM_VERSION}"
+
+# ------------------------------------------------------------------
+# 6. 拷入本地源码, 由 lazyllm 自己安装 extra 依赖
+#    (从 /tmp/LazyLLM 执行, install 会读取该目录 pyproject.toml 的依赖表)
+# ------------------------------------------------------------------
+COPY . /tmp/LazyLLM
+RUN cd /tmp/LazyLLM && \
+    conda run -n lazyllm --no-capture-output lazyllm install ${LAZYLLM_EXTRAS} ${LAZYLLM_EXTRA_PKGS} 2>&1
+
+# ------------------------------------------------------------------
+# 7. 用本地 NPU 适配源码覆盖已安装的 lazyllm .py 文件 (合并拷贝, 保留 lazyllm_cpp*.so)
+# ------------------------------------------------------------------
+RUN set -ex && \
+    SITE=$(conda run -n lazyllm python -c "import site;print(site.getsitepackages()[0])") && \
+    cp -rf /tmp/LazyLLM/lazyllm/. "$SITE/lazyllm/" && \
+    cp -f /tmp/LazyLLM/pyproject.toml "$SITE/lazyllm/pyproject.toml" && \
+    find "$SITE/lazyllm" -name '__pycache__' -type d -exec rm -rf {} + && \
+    conda run -n lazyllm python -c "import lazyllm, pathlib; print('lazyllm from', pathlib.Path(lazyllm.__file__).parent)"
+
+# ------------------------------------------------------------------
+# 7b. lmdeploy + dlinfer (NPU/910B 实机验证的完整方案; 二级依赖见 7c)
+#     * 官方 PyPI 的 `lmdeploy` 只发 manylinux2014_x86_64 / win_amd64 wheel, 无 aarch64
+#       包 (pip 报 "versions: none"), arm 上官方 pip 直装永久不可行。
+#     * lmdeploy pytorch 引擎在昇腾上依赖 dlinfer —— dlinfer 无任何 PyPI/镜像发行,
+#       只能在 910B 上现场源码编译 (依赖 gcc/cmake/CANN/torch_npu), 构建机(x86)无法复现。
+#     => 两者都固化为仓库 vendored 制品, 构建期直接 COPY 进 site-packages:
+#          back/LazyLLM/lazyllm_lmdeploy/lmdeploy/         纯 Python 部分(剔除 x86 .so/__pycache__)
+#          back/LazyLLM/lazyllm_lmdeploy/lmdeploy-0.10.2.dist-info/
+#          back/LazyLLM/lazyllm_lmdeploy/dlinfer/          dlinfer 编译产物(含 ascend_extension.so
+#                                                          与 AtbGraph libdicp_model.so)
+#          back/LazyLLM/lazyllm_lmdeploy/<dlinfer dist-info>/
+#     deploy.LMDeploy adapter 在 torch_npu 存在时自动补 --device ascend + --eager-mode
+#     (910B 默认 graph 模式在 warmup 必崩, 必须 eager; 见 adapter 改动)。
+# ------------------------------------------------------------------
+RUN set -e; \
+    SITE=$(conda run -n lazyllm python -c "import site;print(site.getsitepackages()[0])"); \
+    if [ -d /tmp/LazyLLM/lazyllm_lmdeploy/lmdeploy ]; then \
+        echo 'lmdeploy: 使用仓库 vendored 纯 Python 包 (官方无 aarch64 wheel)'; \
+        cp -rf /tmp/LazyLLM/lazyllm_lmdeploy/lmdeploy "$SITE/lmdeploy"; \
+        rm -f "$SITE/lmdeploy/lib/_turbomind"*.so; \
+        find "$SITE/lmdeploy" -name '__pycache__' -type d -exec rm -rf {} + || true; \
+    else \
+        echo 'lmdeploy: 无 vendored 代码, 退回官方 pip (arm 大概率失败)'; \
+        conda run -n lazyllm pip install --no-cache-dir 'lmdeploy>=0.10.0,<0.11' >/dev/null 2>&1 || \
+            echo 'warn: lmdeploy 不可用 (官方无 arm 包且无 vendored 代码)'; \
+    fi; \
+    if [ -d /tmp/LazyLLM/lazyllm_lmdeploy/dlinfer ]; then \
+        echo 'dlinfer: 使用仓库编译产物 (无任何 PyPI 发行)'; \
+        cp -rf /tmp/LazyLLM/lazyllm_lmdeploy/dlinfer "$SITE/dlinfer"; \
+        find "$SITE/dlinfer" -name '__pycache__' -type d -exec rm -rf {} + || true; \
+    else \
+        echo 'warn: dlinfer 缺失, lmdeploy ascend 引擎不可用'; \
+    fi; \
+    for d in /tmp/LazyLLM/lazyllm_lmdeploy/lmdeploy-*.dist-info /tmp/LazyLLM/lazyllm_lmdeploy/dlinfer*.dist-info; do \
+        [ -d "$d" ] && cp -r "$d" "$SITE/"; \
+    done; \
+    printf '#!/bin/bash\nexec /opt/miniconda3/envs/lazyllm/bin/python -c "from lmdeploy.cli import run; run()" "$@"\n' > /opt/miniconda3/envs/lazyllm/bin/lmdeploy; \
+    chmod +x /opt/miniconda3/envs/lazyllm/bin/lmdeploy
+
+# ------------------------------------------------------------------
+# 7c. lmdeploy 运行时二级依赖 (纯 Python, pip 直装; 源见 lazylm_lmdeploy/requirements-lmdeploy-npu.txt)
+#     transformers 必须 ==4.51.0: lmdeploy 0.10.2 硬性要求, 且 qwen3 等新架构要新版
+#     transformers 才能被 AutoConfig 识别 (4.48.0 的 CONFIG_MAPPING 无 qwen3)。
+#     覆盖 6 步 lazyllm install 装出的版本, 实机验证 import lazyllm 不受影响。
+#     校验说明: 构建期没有宿主机驱动 (libascend_hal.so 由运行时挂载), 因此
+#     `import torch` 默认会自动加载 torch_npu 后端并失败, dlinfer 也直接 import
+#     torch_npu 无法验证。这里用 TORCH_DEVICE_BACKEND_AUTOLOAD=0 关掉自动加载,
+#     校验纯 Python 依赖图 (lmdeploy/transformers) + dlinfer 包存在性;
+#     真正的 dlinfer 加载留给线上启动时的 npu 预检。
+#     numpy 必须锁 1.26.4: 7c 的 xgrammar/apache-tvm-ffi 会让 pip 顺手把 numpy 升到
+#     2.x, 而 CANN 8.1.RC1 的 TBE 编译器还用 np.float_ (numpy 2 已删除), 启动时会报
+#     `SetPrecisionMode ... error code is 500001 / EC0010: np.float_ was removed`。
+#     命令行显式再带一次 pin, 并在末尾硬断言, 防止又被打回 2.x 而构建还"成功"。
+# ------------------------------------------------------------------
+RUN set -e; \
+    conda run -n lazyllm pip install --no-cache-dir \
+        -r /tmp/LazyLLM/lazyllm_lmdeploy/requirements-lmdeploy-npu.txt 'numpy==1.26.4'; \
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 conda run -n lazyllm python -c "\
+import importlib.util as u, lmdeploy, transformers; \
+print('lmdeploy', lmdeploy.__file__, '| transformers', transformers.__version__, '| dlinfer spec:', bool(u.find_spec('dlinfer')))"; \
+    conda run -n lazyllm python -c "from importlib.metadata import version as v; print('dlinfer-ascend', v('dlinfer-ascend'), '| lmdeploy', v('lmdeploy'))"; \
+    conda run -n lazyllm python -c "\
+import numpy; \
+assert numpy.__version__.startswith('1.'), 'numpy ' + numpy.__version__ + ' breaks CANN TBE (np.float_ removed in numpy 2)'; \
+print('numpy', numpy.__version__, 'ok')"
+
+# ------------------------------------------------------------------
+# 8. 构建期自检 (此阶段无 NPU 驱动/libascend_hal.so, 只用 AUTOLOAD=0 校验纯 Python 依赖)
+#    torch_npu 本体 / dlinfer / NPU 可用性只能在运行期校验, 这里只检查包是否落盘。
+# ------------------------------------------------------------------
+RUN TORCH_DEVICE_BACKEND_AUTOLOAD=0 conda run -n lazyllm --no-capture-output python -c "\
+import torch, llamafactory, sentence_transformers, lazyllm, importlib.util as u; \
+print('imports ok | torch', torch.__version__, '| torch_npu:', bool(u.find_spec('torch_npu')), '| lmdeploy:', bool(u.find_spec('lmdeploy')), '| dlinfer:', bool(u.find_spec('dlinfer')), '| infinity_emb:', bool(u.find_spec('infinity_emb')))" 2>&1 || true
+
+RUN rm -rf /tmp/LazyLLM && conda run -n lazyllm pip cache purge || true
+
+# ------------------------------------------------------------------
+# 9. 运行配置
+#    LAZYLLM_NPU_VISIBLE=true: 容器能看到全部 NPU 时, 由 launcher 动态选空闲卡;
+#    若用 k8s 昇腾 device-plugin 注入 ASCEND_RT_VISIBLE_DEVICES, 则保持 false(默认)。
+# ------------------------------------------------------------------
+ENV LAZYLLM_NPU_VISIBLE=true
+ENV APP=/app
+ENV WORKDIR_ROOT=/root
+WORKDIR /root
+
+# ------------------------------------------------------------------
+# 10. 运行时环境固化为镜像 (启动入口只保留受许可保护的 boot()):
+#     - setuptools 修复 (conda env lazyllm)
+#     - 昇腾动态库 ldconfig
+#     - LD_LIBRARY_PATH / ASCEND_HOME / ASCEND_TOOLKIT_HOME
+# ------------------------------------------------------------------
+RUN /opt/miniconda3/envs/lazyllm/bin/pip install --no-cache-dir 'setuptools<80'
+RUN printf '%s\n' '/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/lib64' > /etc/ld.so.conf.d/ascend-toolkit.conf
+RUN ldconfig || true
+ENV LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/lib64:/usr/local/Ascend/ascend-toolkit/latest/fwkacllib/lib64:/usr/local/Ascend/ascend-toolkit/latest/hccl/lib64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver
+ENV ASCEND_HOME=/usr/local/Ascend/ascend-toolkit/latest
+ENV ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/latest
+
+# ------------------------------------------------------------------
+# 11. 许可守护模块 (_launcher.so)
+#     本镜像不再内置 .so —— 由运行时单文件挂载到 /opt/llm-service/:
+#       docker/docker-compose.yml volumes:
+#         ./license/_launcher.cpython-310-aarch64-linux-gnu.so:\
+#         /opt/llm-service/_launcher.cpython-310-aarch64-linux-gnu.so:ro
+#     更新许可 = 覆盖 .so + docker compose restart, 不重建镜像、不重跑 install。
+#     .so 由 docker/license/build.sh 生成: 授权参数 + 业务逻辑(app_main.py 内嵌、
+#     XOR 混淆) 均烧入二进制; docker/license/ 整体在 .dockerignore 排除。
+#     缺失挂载时容器 import 立即失败并退出 (fail-closed)。
+#     入口: python -c "import _launcher; _launcher.boot()"
+# ------------------------------------------------------------------
+
+EXPOSE 31340 31341
+
+ENTRYPOINT ["/bin/bash"]

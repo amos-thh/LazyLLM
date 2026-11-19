@@ -3,6 +3,7 @@ import lazyllm
 import math
 import shutil
 import functools
+import importlib.util
 import re
 from lazyllm import launchers, deploy, LazyLLMLaunchersBase, config
 from ..deploy.base import LazyLLMDeployBase
@@ -20,6 +21,12 @@ from typing import Optional
 def check_cmd(framework):
     framework_mapping = dict(mindie='mindieservice_daemon')
     return bool(shutil.which(framework_mapping.get(framework, framework)))
+
+
+def _is_npu_available():
+    if importlib.util.find_spec('torch_npu') is not None:
+        return True
+    return shutil.which('npu-smi') is not None
 
 
 class AutoDeploy(LazyLLMDeployBase):
@@ -62,7 +69,14 @@ class AutoDeploy(LazyLLMDeployBase):
             ngpus = (1 << (math.ceil(size * 2 * 0.6 / config['gpu_memory']) - 1).bit_length())
             launcher = launchers.remote(ngpus = ngpus)
 
-        for deploy_cls in ['vllm', 'lightllm', 'lmdeploy', 'mindie']:
+        if not _is_npu_available():
+            deploy_priority = ['vllm', 'lightllm', 'lmdeploy', 'mindie']
+        elif check_cmd('mindie'):
+            # 昇腾 NPU: MindIE 优先, 否则用 LMDeploy(Ascend) 推理
+            deploy_priority = ['mindie', 'lmdeploy']
+        else:
+            deploy_priority = ['lmdeploy']
+        for deploy_cls in deploy_priority:
             if check_cmd(deploy_cls) or check_requirements(requirements.get(deploy_cls)):
                 deploy_cls = getattr(deploy, deploy_cls)
                 return deploy_cls, launcher, kw

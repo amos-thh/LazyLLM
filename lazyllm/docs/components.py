@@ -1586,7 +1586,9 @@ Keyword Args:
     server-port (Optional[int]): 服务端口号，默认为 ``None``，此时会自动随机分配 30000–40000 区间的端口。  
     max-batch-size (int): 最大批处理大小，默认为 ``128``。  
     chat-template (Optional[str]): 对话模板文件路径。若模型不是视觉语言模型且未指定模板，将使用默认模板。  
-    eager-mode (bool): 是否启用 eager 模式，受环境变量 ``LMDEPLOY_EAGER_MODE`` 控制，默认为 ``False``。  
+    eager-mode (bool): 是否启用 eager 模式，受环境变量 ``LMDEPLOY_EAGER_MODE`` 控制，
+        默认自动：昇腾 (torch_npu) 上为 True (910B 上 graph 模式在 warmup 会崩溃)，其他设备
+        False；显式设为 ``false`` 可强制关闭 eager。  
 ''')
 
 add_english_doc('deploy.LMDeploy', '''\
@@ -1605,7 +1607,8 @@ Keyword Args:
     server-port (Optional[int]): Port number for the service. Defaults to ``None``; in this case, a random port between 30000–40000 will be assigned.  
     max-batch-size (int): Maximum batch size, defaults to ``128``.  
     chat-template (Optional[str]): Path to the chat template file. If the model is not a vision-language model and no template is specified, a default template will be used.  
-    eager-mode (bool): Whether to enable eager mode, controlled by the environment variable ``LMDEPLOY_EAGER_MODE``, defaults to ``False``.  
+    eager-mode (bool): Whether to enable eager mode, controlled by the environment variable ``LMDEPLOY_EAGER_MODE``.  
+        Auto by default: ``True`` on Ascend (torch_npu; graph mode crashes at warmup on 910B), ``False`` elsewhere. Set ``false`` explicitly to force graph mode.  
 ''')
 
 add_example('deploy.LMDeploy', '''\

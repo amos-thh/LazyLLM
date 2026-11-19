@@ -11,6 +11,7 @@ from async_timeout import timeout
 
 import lazyllm
 from lazyllm.launcher import Status
+from lazyllm.launcher.base import parse_npu_smi_info
 from lazyllm import FastapiApp as app
 from ..services import ServerBase
 
@@ -153,7 +154,13 @@ class InferServer(ServerBase):
         )
         if job.framework.lower() not in ("infinity", "embeddingdeploy", "rerankdeploy"):
             hypram["tp"] = job.num_gpus
-            hypram["gpu_memory_utilization"] = 0.3
+            # `gpu_memory_utilization` 是 vLLM 专有参数, 不能透传给其它后端:
+            # LMDeploy/Mindie/Lightllm 的 ArgsDict 白名单校验会直接抛
+            # `AssertionError: unexpected keys`, 服务起不来。
+            # 其它后端沿用各自的显存策略即可 (LMDeploy 的 cache-max-entry-count
+            # 按"空闲显存"比例计算, 默认 0.8 本身就不会 OOM)。
+            if job.framework.lower() == "vllm":
+                hypram["gpu_memory_utilization"] = 0.3
         m = lazyllm.TrainableModule(job.model_name, use_model_map=False).deploy_method(
             (getattr(lazyllm.deploy, job.framework), hypram)
         )
@@ -290,32 +297,62 @@ class InferServer(ServerBase):
                  '--format=csv,noheader,nounits'],
                 capture_output=True, text=True, timeout=10
             )
-            if result.returncode != 0:
-                return {'gpu_count': 0, 'gpus': [], 'error': result.stderr.strip()}
-            visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
-            visible_set = set(int(x) for x in visible_devices.strip().split(',')) if visible_devices else None
-            gpus = []
-            for line in result.stdout.strip().split('\n'):
-                if not line.strip():
-                    continue
-                parts = [p.strip() for p in line.split(',')]
-                if len(parts) >= 7:
-                    idx = int(parts[0])
-                    if visible_set is not None and idx not in visible_set:
-                        continue
-                    gpus.append({
-                        'index': idx,
-                        'name': parts[1],
-                        'utilization_gpu': f'{parts[2]}%',
-                        'memory_total_mb': parts[3],
-                        'memory_used_mb': parts[4],
-                        'memory_free_mb': parts[5],
-                        'temperature_gpu': f'{parts[6]}°C',
-                    })
-            return {'gpu_count': len(gpus), 'gpus': gpus}
+            if result.returncode == 0:
+                return self._parse_nvidia_status(result.stdout)
+            return self._get_npu_status()
         except FileNotFoundError:
+            npu_status = self._get_npu_status()
+            if npu_status is not None:
+                return npu_status
             return {'gpu_count': 0, 'gpus': [], 'error': 'nvidia-smi not found (no NVIDIA GPU?)'}
         except subprocess.TimeoutExpired:
             return {'gpu_count': 0, 'gpus': [], 'error': 'nvidia-smi timed out'}
         except Exception as e:
             return {'gpu_count': 0, 'gpus': [], 'error': str(e)}
+
+    def _parse_nvidia_status(self, stdout):
+        visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+        visible_set = set(int(x) for x in visible_devices.strip().split(',')) if visible_devices else None
+        gpus = []
+        for line in stdout.strip().split('\n'):
+            if not line.strip():
+                continue
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) >= 7:
+                idx = int(parts[0])
+                if visible_set is not None and idx not in visible_set:
+                    continue
+                gpus.append({
+                    'index': idx,
+                    'name': parts[1],
+                    'utilization_gpu': f'{parts[2]}%',
+                    'memory_total_mb': parts[3],
+                    'memory_used_mb': parts[4],
+                    'memory_free_mb': parts[5],
+                    'temperature_gpu': f'{parts[6]}°C',
+                })
+        return {'gpu_count': len(gpus), 'gpus': gpus}
+
+    def _get_npu_status(self):
+        try:
+            result = subprocess.run(['npu-smi', 'info'], capture_output=True, text=True, timeout=10)
+            if result.returncode != 0:
+                return {'gpu_count': 0, 'gpus': [], 'error': result.stderr.strip()}
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        except Exception as e:
+            return {'gpu_count': 0, 'gpus': [], 'error': str(e)}
+
+        gpus = []
+        for item in parse_npu_smi_info(result.stdout):
+            idx = item['index']
+            gpus.append({
+                'index': idx,
+                'name': 'Ascend NPU',
+                'utilization_gpu': 'N/A',
+                'memory_total_mb': item['hbm_total_mib'],
+                'memory_used_mb': item['hbm_used_mib'],
+                'memory_free_mb': item['hbm_free_mib'],
+                'temperature_gpu': 'N/A',
+            })
+        return {'gpu_count': len(gpus), 'gpus': gpus}
