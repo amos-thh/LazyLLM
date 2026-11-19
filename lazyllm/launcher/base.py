@@ -362,9 +362,23 @@ class EmptyLauncher(LazyLLMLaunchersBase):
         npu_info = [(item['index'], item['hbm_free_mib']) for item in parse_npu_smi_info(output)]
         npu_info.sort(key=lambda x: x[1], reverse=True)
 
+        # 手工挂载设备(无 ascend-docker-runtime)时, npu-smi 报的是物理卡号
+        # (如 6/7), 但 ASCEND_RT_VISIBLE_DEVICES 要的是容器内 ACL 重新编号
+        # 后的逻辑卡号(0..N-1)。直接拿物理卡号会报
+        #   set ASCEND_RT_VISIBLE_DEVICES:7 error, input data rang[0-1)
+        # 这里按 /dev/davinci* 的顺序做 物理->逻辑 映射。
+        try:
+            phys_ids = sorted({int(name[7:]) for name in os.listdir('/dev')
+                               if name.startswith('davinci') and name[7:].isdigit()})
+            phys_to_logical = {phys: idx for idx, phys in enumerate(phys_ids)}
+        except OSError:
+            phys_to_logical = {}
+        npu_info = [(phys_to_logical.get(idx, idx), mem) for idx, mem in npu_info]
+
         str_num = os.getenv('ASCEND_RT_VISIBLE_DEVICES', None)
         if str_num:
-            sub_npus = [int(x) for x in str_num.strip().split(',')]
+            # 已注入的值可能是物理号(手工误填)或逻辑号(k8s), 统一换算到逻辑空间再过滤
+            sub_npus = [phys_to_logical.get(int(x), int(x)) for x in str_num.strip().split(',')]
             npu_info = [item for item in npu_info if item[0] in sub_npus]
         LOG.info('Memory left:\n' + '\n'.join([f'{item[0]} NPU, left: {item[1]} MiB' for item in npu_info]))
         return [info[0] for info in npu_info]
